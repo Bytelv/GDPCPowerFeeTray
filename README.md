@@ -67,6 +67,23 @@ POST /user/powerfee/getRoomInfo?from=wxminiprogram&implType=CGCOMMON0001&buyMark
   （已用 ASCII 与 UTF-16 双重检索确认 exe 内不含该字符串）。
 - **真正必需的参数是 `implType`**：缺失或填错（如 `BADVALUE`）会返回 `{"ret":false,"msg":"查询失败"}`。
 - **一次拿到全校数据**：单个请求返回全部 **2077** 个房间的当前余额。
+- **请求头里出现 `Origin` 一律 403**（2026-10 实测，对 PWA 方案是决定性约束）：
+
+  | 请求头组合 | 结果 |
+  |---|---|
+  | 基线（不加任何额外头） | **200**，940 KB |
+  | 仅加 `X-Requested-With: XMLHttpRequest` | 200 |
+  | 仅加浏览器 `User-Agent` | 200 |
+  | 仅加 `Origin: https://任意域` | **403** |
+  | `X-Requested-With` + `Origin` | **403** |
+
+  响应里也**没有任何** `Access-Control-Allow-Origin` 头。
+
+  **推论：浏览器无法跨域直连该接口。** 浏览器发起跨域请求时必然携带 `Origin`，
+  服务端 WAF 会直接 403（连 CORS 协商的机会都没有）。因此任何网页前端
+  （PWA / 静态站 / 小程序 WebView）都**必须**经由一个"不带 `Origin` 头"的服务端代理
+  来查询——这也正是托盘程序一直正常工作的原因：它只发
+  `User-Agent` + `X-Requested-With`，从不发 `Origin`（见 `src/PowerFeeTray.cs` 第 528–531 行）。
 - 因此服务端轮询极其廉价：每 30 分钟 1 个请求即可。
 
 响应结构（**以下字段值均为虚构示例，不代表任何真实房间**）：
@@ -231,6 +248,7 @@ GDPCPowerFeeTray/
 ├─ build.ps1                 构建脚本（纯 ASCII，避免 PS5.1 编码问题）
 ├─ src/PowerFeeTray.cs       全部源码（C# 5）
 ├─ src/app.ico               构建时自动生成的图标
+├─ docs/                     已搁置方案的调研存档（见第 6 节）
 ├─ README.md
 ├─ RELEASE_NOTES.md
 └─ .gitignore
@@ -242,10 +260,39 @@ GDPCPowerFeeTray/
 
 ---
 
-## 6. 已知限制与注意事项
+## 6. 已搁置：PWA 推送方案（仅存档）
+
+2026-10 曾做过一套手机端方案（EdgeOne 边缘函数 + KV + 自实现 VAPID / RFC 8291 推送，
+含多宿舍共享与自助注册）。**代码与 138 项自测全部完成并验证通过，但最终决定不采用**，
+相关代码已从仓库移除，只留下调研与实测存档：
+
+| 文档 | 内容 |
+|---|---|
+| [docs/pwa-push-plan.md](docs/pwa-push-plan.md) | 方案设计、EdgeOne/Cloudflare 能力对照、iOS 主屏推送限制、KV 键设计、风险与坑清单 |
+| [docs/deploy-checklist.md](docs/deploy-checklist.md) | 逐步部署手册、国内数据源三选一与费用实算 |
+
+**为什么搁置**（供以后重新评估时参考）：
+
+1. **国内侧数据源是硬约束**：学校服务器只在大陆网络可达（境外 DNS/IP 双层不通），
+   而推送分发必须在海外边缘节点。于是要么依赖一台境内设备常开，要么用国内云函数
+   （SCF 免费额度仅前三个月，实算约 ¥2.5/年）或国内 VPS。
+2. **请求模式更显眼**：网页要想"及时"，轮询就得比托盘程序密。5 分钟一次 = 每天 288 次、
+   每月约 8 GB 流量，是托盘程序默认间隔的 6 倍。万一学校 WAF 因此收紧接口，
+   代价会落到全校同学头上——**这是决定搁置的主要原因。**
+3. **收益与复杂度不划算**：托盘程序已覆盖本机提醒的核心需求，而站点要额外背上
+   域名、备案判断、云函数计费、推送订阅维护这一整套。
+
+> 托盘程序**从未因此改动过**：`src/` 与 `build.ps1` 一行未动；
+> 那套站点的代码也**不在本仓库的历史里**（相关提交从未推送，已就地丢弃）。
+
+---
+
+## 7. 已知限制与注意事项
 
 1. **PC 必须开机运行**。关机/休眠期间不会检测；唤醒后若发现已过检查点会立即补查。
-   这是本方案唯一的真实短板——如果想 7×24 覆盖，需改用国内云函数。
+   这是本方案唯一的真实短板。曾评估用"手机 PWA 推送 + 国内云函数"补上 7×24，
+   **结论是不采用**，调研与费用实算存档见
+   [docs/pwa-push-plan.md](docs/pwa-push-plan.md)（搁置原因见第 6 节）。
 2. **程序已不含任何令牌**。`getRoomInfo` 不校验 token（详见 2.1 节实测证据），
    所以源码、exe、`config.ini` 里都移除了它，配置里也不再出现 `token` 这一行。
    唯一的代价是「用电明细」的浏览器链接不再与小程序 URL 完全一致——
@@ -263,7 +310,7 @@ GDPCPowerFeeTray/
 
 ---
 
-## 7. 开发备忘
+## 8. 开发备忘
 
 - 编译器是 Windows 自带的 `csc.exe`（.NET Framework 4.8），**只支持 C# 5**：
   不能用字符串插值 `$""`、`?.`、`nameof`、表达式体成员、自动属性初始化器。
@@ -284,6 +331,14 @@ GDPCPowerFeeTray/
   「未能创建 SSL/TLS 安全通道」（这个坑在 `--dump-settings` 上踩过一次）。
 - 用 `&` 在 PowerShell 里调用 GUI 子系统的 exe 时**不会等待其退出**，
   验证脚本应改用 `Start-Process -Wait`。
+- **批量改写文件时别用 `Set-Content -Encoding utf8`**：Windows PowerShell 5.1 会写入
+  UTF-8 BOM（曾把一个前端文件写成带 BOM 的）。要么用
+  `[IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($false)))`，
+  要么直接用编辑器改。
+- **这个 shell 还会吞掉传给原生命令的双引号**：`node -e "…"` 或 `git commit -m "…"`
+  里含 ASCII 双引号时会被拆坏，分别表现为 `SyntaxError: Unexpected end of input`
+  和 `error: pathspec '…' did not match any file(s) known to git`。
+  需要多行或含引号的内容时，先写成文件再引用（例如 `git commit -F <文件>`）。
 - **两个通知机制不能同时开**。自绘弹窗与托盘气泡（Win10/11 会转成系统 toast）
   都锚定屏幕右下角，同时触发必然重叠——这是设计问题，不是坐标微调能解决的
   （toast 的堆叠高度随通知条数变化，固定偏移仍会撞）。

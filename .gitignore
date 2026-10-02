@@ -24,3 +24,10 @@ ui_dump.txt
 settings_dump.txt
 ui_preview.png
 *.log
+
+# ---- 已搁置方案（见 README 第 6 节）留下的本机文件 ----
+# 本机仍留有当时生成的推送私钥文件（secrets.local.env），绝不能提交。
+# 这两个目录/文件对应的代码已从仓库移除，文档存档在 docs/。
+secrets.local.env
+*.local.env
+.local/

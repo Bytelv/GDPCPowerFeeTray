@@ -331,6 +331,18 @@ GDPCPowerFeeTray/
   「未能创建 SSL/TLS 安全通道」（这个坑在 `--dump-settings` 上踩过一次）。
 - 用 `&` 在 PowerShell 里调用 GUI 子系统的 exe 时**不会等待其退出**，
   验证脚本应改用 `Start-Process -Wait`。
+- **`NotifyIcon.Text` 在 .NET Framework 上的上限是 63 个字符**，写成 120 也不会
+  被静默截断，而是 setter 直接抛 `ArgumentException`（.NET 6 才放宽到 127 并改为
+  静默截断）。致命之处在于异常发生在 UI 回调里：它会被 `Post` 的 try/catch 吞掉，
+  于是 `HandleResult` 后半段的低电量提醒整轮丢失，日志里只留一行难查的异常。
+  所以托盘文本必须先用 `TrayContext.Trim()` 裁到 63 以内再赋值。
+- **`history.csv` 按房间隔离**：首行是 `# room=<编号>`。换绑房间时旧文件会被
+  归档成 `history-1.csv`（序号递增，上限 100 个）再从零累计，否则旧房间的余额落差
+  会被当成新房间的消耗，算出「约可用 0.x 天」这种离谱结论并写进告警弹窗。
+  老版本的两列格式（无表头）视为当前房间的数据，读取时会自动补上表头。
+- **`powerBalance` 解析失败绝不能按 0 继续用**。学校接口一旦改字段格式，
+  0 会让所有房间都低于阈值：托盘全红，并弹出「剩余 50.00度 / 已低于提醒阈值」
+  这种自相矛盾的告警。现在解析不出余额的房间直接跳过，一个都没有时整轮报失败。
 - **批量改写文件时别用 `Set-Content -Encoding utf8`**：Windows PowerShell 5.1 会写入
   UTF-8 BOM（曾把一个前端文件写成带 BOM 的）。要么用
   `[IO.File]::WriteAllText($p, $t, (New-Object System.Text.UTF8Encoding($false)))`，

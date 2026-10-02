@@ -101,7 +101,8 @@ namespace PowerFeeTray
 
         public string BaseUrl = "https://yktxyk.gdppla.edu.cn";
         public string ImplType = "CGCOMMON0001";
-        public int TimeoutSeconds = 20;
+        /// <summary>单次 HTTP 请求的超时秒数（生效值会被夹在 1~300 之间）。</summary>
+        public double TimeoutSeconds = 20;
 
         public double Threshold = 20.0;        // 低于此电量(度)触发提醒
         public int IntervalMinutes = 30;       // 轮询间隔
@@ -158,7 +159,7 @@ namespace PowerFeeTray
                         case "buildingno": c.BuildingNo = v; break;
                         case "baseurl": c.BaseUrl = v; break;
                         case "impltype": c.ImplType = v; break;
-                        case "timeoutseconds": c.TimeoutSeconds = ToInt(v, c.TimeoutSeconds); break;
+                        case "timeoutseconds": c.TimeoutSeconds = ToDouble(v, c.TimeoutSeconds); break;
                         case "threshold": c.Threshold = ToDouble(v, c.Threshold); break;
                         case "intervalminutes": c.IntervalMinutes = ToInt(v, c.IntervalMinutes); break;
                         case "cooldownminutes": c.CooldownMinutes = ToInt(v, c.CooldownMinutes); break;
@@ -181,6 +182,15 @@ namespace PowerFeeTray
             {
                 c.Balloon = false;
                 Log.Write("配置里 popup 与 balloon 同时为 true，已自动关闭 balloon 以免提醒重叠");
+            }
+
+            // 超时必须是正数且不能离谱：HttpWebRequest 的超时是 int 毫秒，
+            // 填 0 会直接抛异常，填太大则一次查询能挂住整个轮询周期。
+            if (c.TimeoutSeconds < 1 || c.TimeoutSeconds > 300)
+            {
+                Log.Write("配置里的 timeoutSeconds=" + c.TimeoutSeconds +
+                          " 超出 1~300 的范围，已按 20 秒处理");
+                c.TimeoutSeconds = 20;
             }
 
             return c;
@@ -225,7 +235,8 @@ namespace PowerFeeTray
                 sb.AppendLine("# 真正必需的是 implType，取值为该学校的电控厂商实现编号。");
                 sb.AppendLine("baseUrl = " + BaseUrl);
                 sb.AppendLine("implType = " + ImplType);
-                sb.AppendLine("timeoutSeconds = " + TimeoutSeconds);
+                sb.AppendLine("# 单次查询的超时时间(秒)，有效范围 1 ~ 300");
+                sb.AppendLine("timeoutSeconds = " + TimeoutSeconds.ToString(CultureInfo.InvariantCulture));
 
                 File.WriteAllText(Paths.Config, sb.ToString(), new UTF8Encoding(true));
             }
@@ -270,6 +281,29 @@ namespace PowerFeeTray
         public string Unit = "度";
         public string BalanceText = "";
         public double Balance;
+        /// <summary>
+        /// powerBalance 是否真的解析成功过。
+        ///
+        /// 解析失败时不能把 Balance 当 0 用：否则阈值判断会把「余额未知」
+        /// 当成「余额 0 度」，托盘变红并弹出「剩余 50.00度 / 已低于提醒阈值」
+        /// 这种自相矛盾的告警。服务端字段一旦改格式，就会全量误报。
+        /// </summary>
+        public bool HasBalance;
+
+        /// <summary>
+        /// 用于提示文本的余额描述：优先用服务端给的字符串（格式与本程序改动前完全一致），
+        /// 它缺失时才用已解析的数值，数值也不可用时说明原因。
+        /// </summary>
+        public string BalanceDisplay
+        {
+            get
+            {
+                if (!string.IsNullOrEmpty(BalanceText)) return BalanceText;
+                if (HasBalance)
+                    return Balance.ToString("0.##", CultureInfo.InvariantCulture) + Unit;
+                return "余额未知";
+            }
+        }
 
         public string Label
         {
@@ -323,7 +357,7 @@ namespace PowerFeeTray
                              "&implType=" + Uri.EscapeDataString(cfg.ImplType) +
                              "&buyMark=";
 
-                string json = Post(url, "");
+                string json = Post(url, "", cfg.TimeoutSeconds);
 
                 JavaScriptSerializer js = new JavaScriptSerializer();
                 js.MaxJsonLength = 32 * 1024 * 1024;
@@ -375,13 +409,23 @@ namespace PowerFeeTray
                     string unit = GetS(d, "du");
                     if (unit.Length > 0) r.Unit = unit;
                     r.BalanceText = GetS(d, "formatPowerBalanceStr");
-
-                    double bal;
-                    string bs = GetS(d, "powerBalance");
-                    if (double.TryParse(bs, NumberStyles.Float, CultureInfo.InvariantCulture, out bal))
-                        r.Balance = bal;
+                    if (!TryParseBal(d, r))
+                    {
+                        // 余额解析不出来的房间直接排除，避免它被误判成 0 度
+                        Log.Write("跳过余额无法解析的房间: " + r.Label +
+                                  " (powerBalance=\"" + GetS(d, "powerBalance") +
+                                  "\" formatPowerBalanceStr=\"" + r.BalanceText + "\")");
+                        continue;
+                    }
 
                     all.Add(r);
+                }
+
+                if (all.Count == 0)
+                {
+                    qr.Error = "接口返回了 " + arr.Count + " 个房间，但没有任何一个的余额能解析成功。\r\n" +
+                               "可能是学校接口改了字段格式，请查看日志 powerfee.log。";
+                    return qr;
                 }
 
                 qr.TotalRooms = all.Count;
@@ -401,6 +445,13 @@ namespace PowerFeeTray
             {
                 qr.Error = "网络错误: " + wex.Message;
                 Log.Write("查询异常(WebException): " + wex.Message);
+                // WebException.Response 是持有连接/流的非托管资源，不释放会在
+                // 「服务器长期不可达、每 5 分钟重试一次」的场景里缓慢累积句柄
+                if (wex.Response != null)
+                {
+                    try { wex.Response.Close(); }
+                    catch { }
+                }
                 return qr;
             }
             catch (Exception ex)
@@ -420,7 +471,7 @@ namespace PowerFeeTray
                              "?from=wxminiprogram" +
                              "&implType=" + Uri.EscapeDataString(cfg.ImplType) +
                              "&buyMark=";
-                string json = Post(url, "");
+                string json = Post(url, "", cfg.TimeoutSeconds);
                 JavaScriptSerializer js = new JavaScriptSerializer();
                 js.MaxJsonLength = 32 * 1024 * 1024;
                 Dictionary<string, object> root = js.Deserialize<Dictionary<string, object>>(json);
@@ -441,11 +492,17 @@ namespace PowerFeeTray
                     string unit = GetS(d, "du");
                     if (unit.Length > 0) r.Unit = unit;
                     r.BalanceText = GetS(d, "formatPowerBalanceStr");
-                    double bal;
-                    if (double.TryParse(GetS(d, "powerBalance"), NumberStyles.Float,
-                            CultureInfo.InvariantCulture, out bal))
-                        r.Balance = bal;
+                    if (!TryParseBal(d, r)) continue;      // 余额未知的房间不参与选择
                     list.Add(r);
+                }
+            }
+            catch (WebException wex)
+            {
+                Log.Write("FetchAll 网络错误: " + wex.Message);
+                if (wex.Response != null)
+                {
+                    try { wex.Response.Close(); }
+                    catch { }
                 }
             }
             catch (Exception ex)
@@ -499,6 +556,39 @@ namespace PowerFeeTray
             return "";
         }
 
+        /// <summary>
+        /// 解析 powerBalance 到 r.Balance。成功返回 true 并置 HasBalance；
+        /// 失败返回 false（调用方必须丢弃该房间，绝不能按 0 度继续用）。
+        /// </summary>
+        private static bool TryParseBal(Dictionary<string, object> d, RoomInfo r)
+        {
+            r.HasBalance = false;
+            r.Balance = 0;
+
+            object raw;
+            if (!d.TryGetValue("powerBalance", out raw) || raw == null) return false;
+
+            double bal;
+            string s;
+            if (raw is double) bal = (double)raw;
+            else if (raw is decimal) bal = (double)(decimal)raw;
+            else if (raw is int) bal = (int)raw;
+            else if (raw is long) bal = (long)raw;
+            else if (raw is float) bal = (float)raw;
+            else
+            {
+                s = Convert.ToString(raw).Trim();
+                if (s.Length == 0) return false;
+                if (!double.TryParse(s, NumberStyles.Float,
+                        CultureInfo.InvariantCulture, out bal)) return false;
+            }
+
+            if (double.IsNaN(bal) || double.IsInfinity(bal)) return false;
+            r.Balance = bal;
+            r.HasBalance = true;
+            return true;
+        }
+
         private static bool ToBool(object o)
         {
             if (o == null) return false;
@@ -521,7 +611,7 @@ namespace PowerFeeTray
             return list;
         }
 
-        private static string Post(string url, string body)
+        private static string Post(string url, string body, double timeoutSeconds)
         {
             HttpWebRequest req = (HttpWebRequest)WebRequest.Create(url);
             req.Method = "POST";
@@ -532,8 +622,14 @@ namespace PowerFeeTray
             req.Headers.Add("Accept-Language", "zh-CN,zh;q=0.9");
             req.KeepAlive = false;
             req.Proxy = null;                 // 避免受系统代理拖慢
-            req.Timeout = 20000;
-            req.ReadWriteTimeout = 20000;
+
+            // timeoutSeconds 来自 config.ini，这里再兜一次底：HttpWebRequest 的超时是
+            // int 毫秒，0 会直接抛异常，过大则一次查询能挂住整个轮询周期。
+            if (double.IsNaN(timeoutSeconds) || timeoutSeconds < 1.0 || timeoutSeconds > 300.0)
+                timeoutSeconds = 20.0;
+            int ms = (int)Math.Round(timeoutSeconds * 1000.0);
+            req.Timeout = ms;
+            req.ReadWriteTimeout = ms;
 
             byte[] data = Encoding.UTF8.GetBytes(body ?? "");
             req.ContentLength = data.Length;
@@ -558,59 +654,188 @@ namespace PowerFeeTray
     {
         private const int MaxPoints = 4000;
 
-        public static List<HistoryPoint> Load()
+        /// <summary>历史文件首行记录的「这份历史属于哪个房间」。</summary>
+        private const string RoomHeaderPrefix = "# room=";
+
+        /// <summary>
+        /// 当前监控房间的标识。优先用服务端的内部编号（换绑房间后必然不同），
+        /// 编号没拿到时退回「校区|楼栋|房间」。
+        /// </summary>
+        public static string RoomKey(Config cfg)
+        {
+            if (cfg == null) return "";
+            if (!string.IsNullOrEmpty(cfg.RoomNum)) return "num:" + cfg.RoomNum;
+            if (!cfg.HasRoom) return "";
+            return "name:" + cfg.Campus + "|" + cfg.Building + "|" + cfg.Room;
+        }
+
+        /// <summary>
+        /// 读取属于给定房间的历史点。
+        ///
+        /// 历史文件按房间隔离：首行是 `# room=&lt;key&gt;`，只有该房间的数据会被返回。
+        /// 房间变了（设置里换绑）时会先把旧文件归档成 history-1.csv、history-2.csv …
+        /// 再从空历史开始 —— 否则旧房间的余额落差会被当成新房间的消耗，
+        /// 算出「约可用 0.x 天」这种完全错误的结论并写进告警弹窗。
+        /// 老版本的两列格式（无表头）视为当前房间的数据，自动补上表头。
+        /// </summary>
+        public static List<HistoryPoint> Load(string roomKey)
         {
             List<HistoryPoint> list = new List<HistoryPoint>();
+            if (string.IsNullOrEmpty(roomKey)) return list;
+
+            bool fileIsMine = false;    // 文件里的数据是否属于当前房间
+            bool hasHeader = false;
             try
             {
                 if (!File.Exists(Paths.History)) return list;
-                foreach (string line in File.ReadAllLines(Paths.History, Encoding.UTF8))
+
+                // 用无 BOM 的 UTF8Encoding 读取：File.ReadAllLines 会自动识别并吃掉 BOM，
+                // 否则首行的 "# room=" 会带上 U+FEFF 而匹配不上。
+                string[] lines = File.ReadAllLines(Paths.History, new UTF8Encoding(false));
+
+                // 第一遍：只看表头，判断这份历史属于哪个房间
+                foreach (string line in lines)
                 {
-                    string s = line.Trim();
-                    if (s.Length == 0 || s.StartsWith("#")) continue;
-                    string[] p = s.Split(',');
-                    if (p.Length < 2) continue;
-                    DateTime t;
-                    double v;
-                    if (!DateTime.TryParse(p[0], CultureInfo.InvariantCulture,
-                            DateTimeStyles.None, out t)) continue;
-                    if (!double.TryParse(p[1], NumberStyles.Float,
-                            CultureInfo.InvariantCulture, out v)) continue;
-                    HistoryPoint hp = new HistoryPoint();
-                    hp.T = t; hp.V = v;
-                    list.Add(hp);
+                    string s = line.Trim().TrimStart('\uFEFF');
+                    if (s.Length == 0) continue;
+                    if (s[0] != '#')
+                    {
+                        fileIsMine = true;      // 老格式（无表头）：认作当前房间的数据
+                        break;
+                    }
+                    if (s.StartsWith(RoomHeaderPrefix))
+                    {
+                        hasHeader = true;
+                        fileIsMine = (s.Substring(RoomHeaderPrefix.Length).Trim() == roomKey);
+                        break;
+                    }
+                }
+
+                // 第二遍：解析数据点（表头行本身不含逗号时间，会被下面跳过）
+                if (fileIsMine)
+                {
+                    foreach (string line in lines)
+                    {
+                        HistoryPoint hp = ParsePoint(line);
+                        if (hp != null) list.Add(hp);
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Log.Write("读取历史失败: " + ex.Message);
+                return new List<HistoryPoint>();
             }
+
+            // 表头存在且不是本房间：归档旧文件，本房间从零开始
+            if (hasHeader && !fileIsMine)
+            {
+                int n = Archive();
+                Log.Write("监控房间已变更，旧历史" +
+                          (n > 0 ? "已归档为 history-" + n + ".csv" : "归档失败，直接清空") +
+                          "，日均用量/可用天数重新累计");
+                WriteFile(roomKey, new List<HistoryPoint>());
+                return new List<HistoryPoint>();
+            }
+
+            // 老格式补写表头，避免下次启动被误判成别的房间
+            if (!hasHeader && list.Count > 0) WriteFile(roomKey, list);
+
             return list;
         }
 
-        public static void Append(double balance)
+        /// <summary>解析一行 "时间,余额"，注释行或格式不对时返回 null。</summary>
+        private static HistoryPoint ParsePoint(string line)
+        {
+            string s = (line ?? "").Trim().TrimStart('\uFEFF');
+            if (s.Length == 0 || s[0] == '#') return null;
+            string[] p = s.Split(',');
+            if (p.Length < 2) return null;
+
+            DateTime t;
+            double v;
+            if (!DateTime.TryParse(p[0], CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out t)) return null;
+            if (!double.TryParse(p[1], NumberStyles.Float,
+                    CultureInfo.InvariantCulture, out v)) return null;
+            if (double.IsNaN(v) || double.IsInfinity(v)) return null;
+
+            HistoryPoint hp = new HistoryPoint();
+            hp.T = t; hp.V = v;
+            return hp;
+        }
+
+        public static void Append(string roomKey, double balance)
         {
             try
             {
-                string line = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss",
-                    CultureInfo.InvariantCulture) + "," +
-                    balance.ToString(CultureInfo.InvariantCulture) + "\r\n";
-                File.AppendAllText(Paths.History, line, new UTF8Encoding(true));
+                if (string.IsNullOrEmpty(roomKey))
+                {
+                    Log.Write("历史写入被跳过：当前没有可识别的监控房间");
+                    return;
+                }
 
-                // 简单裁剪，避免无限增长
-                string[] all = File.ReadAllLines(Paths.History, Encoding.UTF8);
-                if (all.Length > MaxPoints)
+                // 全量重写而不是追加：既保证表头与房间一致，
+                // 也顺带把超出上限的旧数据裁掉，不需要额外的读改写往返。
+                List<HistoryPoint> list = Load(roomKey);
+                if (list.Count > 0 &&
+                    (DateTime.Now - list[list.Count - 1].T).TotalSeconds < 60.0)
+                {
+                    // 同一分钟内的重复查询（连点「立即查询」）不重复记点，但余额变了要更新
+                    if (Math.Abs(list[list.Count - 1].V - balance) < 0.0001) return;
+                    list.RemoveAt(list.Count - 1);
+                }
+
+                HistoryPoint hp = new HistoryPoint();
+                hp.T = DateTime.Now; hp.V = balance;
+                list.Add(hp);
+                if (list.Count > MaxPoints)
                 {
                     int keep = MaxPoints / 2;
-                    string[] tail = new string[keep];
-                    Array.Copy(all, all.Length - keep, tail, 0, keep);
-                    File.WriteAllLines(Paths.History, tail, new UTF8Encoding(true));
+                    list.RemoveRange(0, list.Count - keep);
                 }
+                WriteFile(roomKey, list);
             }
             catch (Exception ex)
             {
                 Log.Write("写入历史失败: " + ex.Message);
             }
+        }
+
+        /// <summary>把当前历史文件另存为 history-&lt;序号&gt;.csv，返回序号；失败返回 -1。</summary>
+        private static int Archive()
+        {
+            try
+            {
+                if (!File.Exists(Paths.History)) return -1;
+                for (int i = 1; i <= 100; i++)
+                {
+                    string dst = Path.Combine(Paths.DataDir, "history-" + i + ".csv");
+                    if (File.Exists(dst)) continue;
+                    File.Move(Paths.History, dst);
+                    return i;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Write("归档历史失败: " + ex.Message);
+            }
+            return -1;
+        }
+
+        private static void WriteFile(string roomKey, List<HistoryPoint> list)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("# 宿舍电费提示 —— 余额历史（按监控房间隔离，换绑房间会自动归档重新累计）\r\n");
+            if (!string.IsNullOrEmpty(roomKey)) sb.Append(RoomHeaderPrefix + roomKey + "\r\n");
+            sb.Append("# 时间,余额(度)\r\n");
+            foreach (HistoryPoint hp in list)
+            {
+                sb.Append(hp.T.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                sb.Append(',').Append(hp.V.ToString(CultureInfo.InvariantCulture));
+                sb.Append("\r\n");
+            }
+            File.WriteAllText(Paths.History, sb.ToString(), new UTF8Encoding(true));
         }
 
         /// <summary>
@@ -871,7 +1096,7 @@ namespace PowerFeeTray
             public override string ToString()
             {
                 if (Room == null) return "";
-                return Room.Room + "    (当前 " + Room.BalanceText + ")";
+                return Room.Room + "    (当前 " + Room.BalanceDisplay + ")";
             }
         }
 
@@ -1392,7 +1617,7 @@ namespace PowerFeeTray
                 QueryResult qr = e2.Result as QueryResult;
                 if (qr != null && qr.Ok)
                 {
-                    SetStatus("查询成功：" + qr.Room.Label + "  剩余 " + qr.Room.BalanceText +
+                    SetStatus("查询成功：" + qr.Room.Label + "  剩余 " + qr.Room.BalanceDisplay +
                               "（内部编号 " + qr.Room.RoomNum + "）", Icons.Green);
                 }
                 else
@@ -1544,6 +1769,8 @@ namespace PowerFeeTray
         private RoomInfo _lastRoom;
         private double? _daysLeft;
         private double? _dailyUsage;
+        /// <summary>内存历史对应的房间标识，房间变了就必须整体重置。</summary>
+        private string _roomKey = "";
 
         private ToolStripMenuItem _miStatus;
         private ToolStripMenuItem _miQuery;
@@ -1560,7 +1787,9 @@ namespace PowerFeeTray
             IntPtr forceHandle = _marshal.Handle;   // 强制创建句柄，BeginInvoke 才能用
 
             _cfg = Config.Load();
-            _history = History.Load();
+            // 只加载当前房间的历史：文件属于别的房间时 Load 会归档旧文件并返回空表
+            _roomKey = History.RoomKey(_cfg);
+            _history = History.Load(_roomKey);
 
             ApplyAutoStart(_cfg.AutoStart);
 
@@ -1792,6 +2021,7 @@ namespace PowerFeeTray
             _nextRun = DateTime.Now.AddMinutes(Math.Max(1, _cfg.IntervalMinutes));
 
             // roomNum 可能被自动匹配出来，回写以便下次精确匹配
+            // （RoomKey 优先用编号，所以这次回写不会把历史错判成另一个房间）
             if (!string.IsNullOrEmpty(qr.Room.RoomNum) && qr.Room.RoomNum != _cfg.RoomNum)
             {
                 _cfg.RoomNum = qr.Room.RoomNum;
@@ -1806,7 +2036,29 @@ namespace PowerFeeTray
                 _cfg.Save();
             }
 
-            History.Append(qr.Room.Balance);
+            // 余额解析不出来时：不记历史、不估用量、不做阈值判断，托盘置灰。
+            // 否则「余额未知」会被当成 0 度，弹出「剩余 50.00度 / 已低于阈值」这种自相矛盾的告警。
+            if (!qr.Room.HasBalance)
+            {
+                _daysLeft = null;
+                _dailyUsage = null;
+                _tray.Icon = Icons.Err;
+                _tray.Text = Trim(AppInfo.Title + " - 余额读取失败");
+                if (_miStatus != null)
+                    _miStatus.Text = "接口返回的余额无法识别，本轮不做判断";
+
+                Log.Write("余额无法识别，跳过阈值判断: " + qr.Room.Label +
+                          " powerBalance 解析失败" +
+                          (qr.Room.BalanceText.Length > 0
+                              ? "，界面文本仍为 \"" + qr.Room.BalanceText + "\""
+                              : ""));
+                return;
+            }
+
+            if (RefreshHistoryForKey())
+                Log.Write("监控房间变更，已重置内存中的余额历史");
+
+            History.Append(History.RoomKey(_cfg), qr.Room.Balance);
             HistoryPoint hp = new HistoryPoint();
             hp.T = DateTime.Now; hp.V = qr.Room.Balance;
             _history.Add(hp);
@@ -1822,7 +2074,7 @@ namespace PowerFeeTray
             else _tray.Icon = Icons.Ok;
 
             UpdateUiText(qr.Room);
-            Log.Write("查询成功: " + qr.Room.Label + " = " + qr.Room.BalanceText +
+            Log.Write("查询成功: " + qr.Room.Label + " = " + qr.Room.BalanceDisplay +
                       (low ? "  [低于阈值]" : "") + (manual ? "  (手动)" : ""));
 
             if (low)
@@ -1838,7 +2090,7 @@ namespace PowerFeeTray
 
         private void UpdateUiText(RoomInfo r)
         {
-            string line1 = r.Label.Replace("学生宿舍", "") + "  " + r.BalanceText;
+            string line1 = r.Label.Replace("学生宿舍", "") + "  " + r.BalanceDisplay;
             string line2 = "每 " + _cfg.IntervalMinutes + " 分钟自动刷新";
             if (_daysLeft.HasValue)
                 line2 = "约可用 " + _daysLeft.Value.ToString("0.0") + " 天 · " + line2;
@@ -1851,7 +2103,7 @@ namespace PowerFeeTray
 
         private void NotifyLow(RoomInfo r)
         {
-            string msg = r.Label + " 剩余 " + r.BalanceText;
+            string msg = r.Label + " 剩余 " + r.BalanceDisplay;
             if (_daysLeft.HasValue)
                 msg += "，约可用 " + _daysLeft.Value.ToString("0.0") + " 天";
 
@@ -1935,6 +2187,11 @@ namespace PowerFeeTray
                 DialogResult dr = f.ShowDialog();
                 if (dr == DialogResult.OK)
                 {
+                    // 换了监控房间就整体重置历史：旧房间的余额落差绝不能被
+                    // 当成新房间的消耗，否则会算出「约可用 0.x 天」这种离谱结论
+                    if (RefreshHistoryForKey())
+                        Log.Write("监控房间已变更，已重置余额历史与用量估算");
+
                     _miSound.Checked = _cfg.Sound;
                     _miAutoStart.Checked = _cfg.AutoStart;
                     Log.Write("设置变更，立即重新查询");
@@ -1942,6 +2199,28 @@ namespace PowerFeeTray
                     QueryNow(false);
                 }
             }
+        }
+
+        /// <summary>
+        /// 若当前配置指向的房间与内存历史所属房间不一致，则重新加载（必要时归档）
+        /// 历史并清空用量估算。返回是否发生了房间变更。
+        /// 除了设置窗口，config.ini 被手工改动也会走到这里。
+        /// </summary>
+        private bool RefreshHistoryForKey()
+        {
+            string key = History.RoomKey(_cfg);
+            if (key == _roomKey) return false;
+
+            _roomKey = key;
+            _history.Clear();
+            if (key.Length > 0)
+            {
+                List<HistoryPoint> loaded = History.Load(key);
+                _history.AddRange(loaded);
+            }
+            _daysLeft = null;
+            _dailyUsage = null;
+            return true;
         }
 
         private static void ApplyAutoStart(bool on)
@@ -1989,12 +2268,21 @@ namespace PowerFeeTray
             ExitThread();
         }
 
-        private static string Trim(string s)
+        /// <summary>
+        /// 托盘提示文本的安全上限。
+        ///
+        /// .NET Framework 的 NotifyIcon.Text 上限是 63 个字符，超长时 setter 直接抛
+        /// ArgumentException（.NET 6 才放宽到 127 并改成静默截断）。超长一旦抛出，
+        /// 异常会被 Post 的 try/catch 吞掉，HandleResult 后半段的低电量提醒就整轮丢失，
+        /// 所以这里必须在赋值前就裁到 63 以内。
+        /// </summary>
+        private const int TrayTextLimit = 63;
+
+        internal static string Trim(string s)
         {
-            // NotifyIcon.Text 有长度上限，超长会抛异常
             if (s == null) return "";
-            if (s.Length <= 120) return s;
-            return s.Substring(0, 117) + "...";
+            if (s.Length <= TrayTextLimit) return s;
+            return s.Substring(0, TrayTextLimit - 3) + "...";
         }
 
         private static string Shorten(string s, int n)
@@ -2094,7 +2382,8 @@ namespace PowerFeeTray
                 sb.AppendLine("OK");
                 sb.AppendLine("label=" + qr.Room.Label);
                 sb.AppendLine("roomNum=" + qr.Room.RoomNum);
-                sb.AppendLine("balance=" + qr.Room.Balance.ToString(CultureInfo.InvariantCulture));
+                sb.AppendLine("balance=" + (qr.Room.HasBalance
+                    ? qr.Room.Balance.ToString(CultureInfo.InvariantCulture) : "N/A(解析失败)"));
                 sb.AppendLine("balanceText=" + qr.Room.BalanceText);
                 sb.AppendLine("totalRooms=" + qr.TotalRooms);
             }
@@ -2155,66 +2444,126 @@ namespace PowerFeeTray
             Application.DoEvents();
             sb.AppendLine(f.DumpState("4. 该楼栋第 1 个房间"));
 
-            // 保存往返测试：切到别的房间保存，验证写盘内容，再还原
+            // 保存往返测试：切到别的房间保存，验证写盘内容，再还原。
+            // 这里动的是用户真实的 config.ini，所以先整份备份，任何一步炸掉
+            // （包括进程被杀）都由 finally 把原文件放回去。
             string oCampus = cfg.Campus, oBuilding = cfg.Building, oRoom = cfg.Room;
-            string oThr = cfg.Threshold.ToString("0.##", CultureInfo.InvariantCulture);
+            string oRoomNum = cfg.RoomNum, oAreaNo = cfg.SchoolAreaNo, oBldgNo = cfg.BuildingNo;
+            double oThreshold = cfg.Threshold;
+            string cfgBefore = ReadOrNull(Paths.Config);
+            string cfgBak = Path.Combine(Paths.DataDir, "config.ini.dumpbak");
             sb.AppendLine();
             sb.AppendLine("--- 5. 保存往返测试（临时切到上面选中的房间）---");
-            bool saved = f.DebugSave();
-            sb.AppendLine("  DebugSave 返回: " + saved);
-            sb.AppendLine("  内存配置: " + cfg.Campus + " / " + cfg.Building + " / " + cfg.Room +
-                          "  roomNum=" + cfg.RoomNum +
-                          "  areaNo=" + cfg.SchoolAreaNo + "  bldgNo=" + cfg.BuildingNo);
-            sb.AppendLine("  写盘内容(房间相关行):");
-            foreach (string line in File.ReadAllLines(Paths.Config, Encoding.UTF8))
+
+            try
             {
-                string t = line.Trim();
-                if (t.StartsWith("campus") || t.StartsWith("building") ||
-                    t.StartsWith("room") || t.StartsWith("schoolAreaNo"))
-                    sb.AppendLine("    " + t);
+                if (cfgBefore != null)
+                {
+                    File.WriteAllText(cfgBak, cfgBefore, new UTF8Encoding(true));
+                    sb.AppendLine("  已备份 config.ini 到 " + cfgBak);
+                }
+
+                bool saved = f.DebugSave();
+                sb.AppendLine("  DebugSave 返回: " + saved);
+                sb.AppendLine("  内存配置: " + cfg.Campus + " / " + cfg.Building + " / " + cfg.Room +
+                              "  roomNum=" + cfg.RoomNum +
+                              "  areaNo=" + cfg.SchoolAreaNo + "  bldgNo=" + cfg.BuildingNo);
+                sb.AppendLine("  写盘内容(房间相关行):");
+                foreach (string line in File.ReadAllLines(Paths.Config, Encoding.UTF8))
+                {
+                    string t = line.Trim();
+                    if (t.StartsWith("campus") || t.StartsWith("building") ||
+                        t.StartsWith("room") || t.StartsWith("schoolAreaNo"))
+                        sb.AppendLine("    " + t);
+                }
+
+                f.DebugSet(oCampus, oBuilding, oRoom);
+                Application.DoEvents();
+                f.DebugSave();
+                sb.AppendLine("  已还原: " + cfg.Campus + " / " + cfg.Building + " / " + cfg.Room +
+                              "  roomNum=" + cfg.RoomNum +
+                              "  areaNo=" + cfg.SchoolAreaNo + "  bldgNo=" + cfg.BuildingNo);
+
+                // 自定义阈值测试：可选可填，非法值必须被拒绝
+                sb.AppendLine();
+                sb.AppendLine("--- 6. 自定义提醒阈值 ---");
+                f.DebugSetThreshold("37.5");
+                Application.DoEvents();
+                sb.AppendLine(f.DumpState("   键入 37.5 后的状态"));
+                bool okCustom = f.DebugSave();
+                sb.AppendLine("   保存返回: " + okCustom + "   cfg.Threshold=" +
+                              cfg.Threshold.ToString("0.##", CultureInfo.InvariantCulture) +
+                              "   (应为 True / 37.5)");
+
+                f.DebugSetThreshold("abc");
+                Application.DoEvents();
+                bool okBad = f.DebugSave();
+                sb.AppendLine("   键入 \"abc\" 保存返回: " + okBad +
+                              "   cfg.Threshold 未变=" +
+                              (cfg.Threshold == 37.5 ? "是" : "否") + "   (应 False / 是)");
+
+                f.DebugSetThreshold("99999");
+                Application.DoEvents();
+                bool okRange = f.DebugSave();
+                sb.AppendLine("   键入 \"99999\"(超范围) 保存返回: " + okRange + "   (应为 False)");
             }
+            finally
+            {
+                // 无论上面成功还是抛异常，都把 config.ini 恢复成开始前的那份字节。
+                //
+                // 这里绝不能走 cfg.Save()：那会用当前版本的模板重写整个文件，
+                // 于是「往返测试」反而给用户的配置加了一堆注释和格式改动。
+                // 只做一件事——把原样内容放回去。
+                try
+                {
+                    if (cfgBefore == null)
+                    {
+                        if (File.Exists(Paths.Config)) File.Delete(Paths.Config);
+                    }
+                    else
+                    {
+                        File.WriteAllText(Paths.Config, cfgBefore, new UTF8Encoding(true));
+                    }
+                    if (File.Exists(cfgBak)) File.Delete(cfgBak);
+                }
+                catch (Exception ex)
+                {
+                    Log.Write("恢复 config.ini 失败: " + ex.Message);
+                }
 
-            f.DebugSet(oCampus, oBuilding, oRoom);
-            Application.DoEvents();
-            f.DebugSave();
-            sb.AppendLine("  已还原: " + cfg.Campus + " / " + cfg.Building + " / " + cfg.Room +
-                          "  roomNum=" + cfg.RoomNum +
-                          "  areaNo=" + cfg.SchoolAreaNo + "  bldgNo=" + cfg.BuildingNo);
+                // 内存里的配置也退回原值，避免这个进程之后带着测试值继续跑
+                cfg.Campus = oCampus;
+                cfg.Building = oBuilding;
+                cfg.Room = oRoom;
+                cfg.RoomNum = oRoomNum;
+                cfg.SchoolAreaNo = oAreaNo;
+                cfg.BuildingNo = oBldgNo;
+                cfg.Threshold = oThreshold;
 
-            // 自定义阈值测试：可选可填，非法值必须被拒绝
-            sb.AppendLine();
-            sb.AppendLine("--- 6. 自定义提醒阈值 ---");
-            f.DebugSetThreshold("37.5");
-            Application.DoEvents();
-            sb.AppendLine(f.DumpState("   键入 37.5 后的状态"));
-            bool okCustom = f.DebugSave();
-            sb.AppendLine("   保存返回: " + okCustom + "   cfg.Threshold=" +
-                          cfg.Threshold.ToString("0.##", CultureInfo.InvariantCulture) +
-                          "   (应为 True / 37.5)");
-
-            f.DebugSetThreshold("abc");
-            Application.DoEvents();
-            bool okBad = f.DebugSave();
-            sb.AppendLine("   键入 \"abc\" 保存返回: " + okBad +
-                          "   cfg.Threshold 未变=" +
-                          (cfg.Threshold == 37.5 ? "是" : "否") + "   (应 False / 是)");
-
-            f.DebugSetThreshold("99999");
-            Application.DoEvents();
-            bool okRange = f.DebugSave();
-            sb.AppendLine("   键入 \"99999\"(超范围) 保存返回: " + okRange + "   (应为 False)");
-
-            f.DebugSetThreshold(oThr);
-            Application.DoEvents();
-            f.DebugSave();
-            sb.AppendLine("   已还原阈值: " +
-                          cfg.Threshold.ToString("0.##", CultureInfo.InvariantCulture));
+                sb.AppendLine("  config.ini 已恢复为测试前的内容（阈值还原为 " +
+                              oThreshold.ToString("0.##", CultureInfo.InvariantCulture) + "）");
+            }
 
             f.Close();
             Application.DoEvents();
 
             File.WriteAllText(Path.Combine(Paths.DataDir, "settings_dump.txt"),
                               sb.ToString(), new UTF8Encoding(false));
+        }
+
+        /// <summary>读取文件内容；文件不存在时返回 null（区别于空文件）。</summary>
+        private static string ReadOrNull(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return null;
+                return File.ReadAllText(path, new UTF8Encoding(false));
+            }
+            catch (Exception ex)
+            {
+                Log.Write("读取 " + path + " 失败: " + ex.Message);
+                return null;
+            }
         }
 
         /// <summary>预览低电量弹窗（示例数据），用于确认提醒样式是否符合预期。</summary>

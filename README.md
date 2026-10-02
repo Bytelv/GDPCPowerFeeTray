@@ -321,7 +321,16 @@ GDPCPowerFeeTray/
   `NullReferenceException` 并直接终止进程（这个坑已踩过）。现用一个永不显示的
   `Form` 作 `BeginInvoke` 宿主。
 - 构建脚本刻意保持 **ASCII-only**：Windows PowerShell 5.1 会把无 BOM 的 `.ps1`
-  按 ANSI 代码页解析，中文字符串会损坏并引发语法错误。
+  按 ANSI 代码页解析，中文字符串会损坏并引发语法错误。**同样的道理也适用于
+  含中文的临时脚本**——写 `.ps1` 时要么全 ASCII，要么确保有 BOM（用编辑器的
+  「UTF-8 with BOM」保存），否则脚本里的中文字面量会把自己搞成语法错误。
+- **往 HTTP 请求体里塞中文时，`Invoke-RestMethod -Body @{...}` 会按 ANSI 代码页
+  编码**，中文全部变成 `?`（曾把一条 GitHub issue 评论发成满屏问号）。正确做法是
+  自己按 UTF-8 取字节再发：`[IO.File]::ReadAllText($p, $utf8NoBom)` 读文本，
+  手工拼 JSON，然后用 `WebClient.UploadData($url, 'POST', $utf8Bytes)`；
+  同时别用 `ConvertTo-Json` 去转非字符串的值——`Get-Content` 不加 `-Raw` 返回的是
+  带 `PSPath`/`PSDrive` 属性的对象，`ConvertTo-Json` 会把**这些属性**序列化进去，
+  请求体里塞满无关元数据并以 422 被拒。
 - **WinForms 的一个硬限制**：`ComboBoxStyle.DropDownList` 搭配
   `AutoCompleteSource.ListItems` 时，`AutoCompleteMode` 只允许 `None`，
   否则构造时直接抛 `NotSupportedException`。所以「纯选择」和「可键入搜索」
